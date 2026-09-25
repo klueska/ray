@@ -12,7 +12,7 @@ from ray.experimental.sandbox._internal.image_utils import (
     ROOTFS_IMAGE,
 )
 from ray.experimental.sandbox.backend.gvisor import GVisorSandboxBackend
-from ray.experimental.sandbox.config import SandboxConfig
+from ray.experimental.sandbox.config import VALID_ROOTFS_TYPES, SandboxConfig
 from ray.experimental.sandbox.exceptions import SandboxCreationError
 from ray.experimental.sandbox.image_manager import (
     BaseImageManager,
@@ -655,13 +655,18 @@ def test_image_cache_eviction(tmp_path):
     assert partial.exists()  # mid-pull (no marker): protected
 
 
-def test_create_oci_spec_requires_cached_image(tmp_path):
+@pytest.mark.parametrize("rootfs_type", VALID_ROOTFS_TYPES)
+def test_create_oci_spec_requires_cached_image(tmp_path, rootfs_type):
     """Spec construction refuses a cache entry with no image rather than
     handing runsc a root it cannot mount."""
     mgr = _StubImageManager(tmp_path)
     os.remove(tmp_path / ROOTFS_IMAGE)
     with pytest.raises(SandboxCreationError, match=ROOTFS_IMAGE):
-        mgr.create_oci_spec(image="fake:latest", base_spec=_sample_base_spec())
+        mgr.create_oci_spec(
+            image="fake:latest",
+            base_spec=_sample_base_spec(),
+            _rootfs_type=rootfs_type,
+        )
 
 
 def test_create_oci_spec_erofs_image(tmp_path):
@@ -684,6 +689,68 @@ def test_create_oci_spec_erofs_image(tmp_path):
     assert spec["root"] == {"path": str(root_path), "readonly": False}
     assert root_path.is_dir()
     assert not (tmp_path / "rootfs").exists()
+
+
+@pytest.mark.parametrize("readonly", [True, False])
+def test_create_oci_spec_overlayfs(tmp_path, readonly):
+    """An overlayfs sandbox gets no gVisor rootfs annotations. Its root.path
+    is where the backend mounts the sandbox's overlay, and readonly holds as
+    requested, even with an explicit workdir, since runsc creates the
+    workdir's mount point in the overlay."""
+    mgr = _StubImageManager(tmp_path)
+    root_path = tmp_path / "bundle" / "rootfs"
+    spec = mgr.create_oci_spec(
+        image="fake:latest",
+        base_spec=_sample_base_spec(),
+        readonly=readonly,
+        workdir_path=str(tmp_path / "work"),
+        root_path=str(root_path),
+        _rootfs_type="overlayfs",
+    )
+    assert spec.get("annotations", {}) == {}
+    assert spec["root"] == {"path": str(root_path), "readonly": readonly}
+
+
+def test_create_oci_spec_rejects_unknown_rootfs_type(tmp_path):
+    mgr = _StubImageManager(tmp_path)
+    with pytest.raises(ValueError, match="Invalid rootfs type"):
+        mgr.create_oci_spec(
+            image="fake:latest",
+            base_spec=_sample_base_spec(),
+            _rootfs_type="squashfs",
+        )
+
+
+def _write_one_file_tar(path, name):
+    with tarfile.open(str(path), "w") as tar:
+        ti = tarfile.TarInfo(name)
+        ti.size = 4
+        tar.addfile(ti, io.BytesIO(b"data"))
+
+
+def test_image_manager_overlayfs_image_is_the_cached_erofs_image(tmp_path):
+    """An overlayfs sandbox's kernel overlay sits on the image's cached
+    rootfs.erofs, and an image that isn't cached fails."""
+    mgr = ImageManager(images_dir=str(tmp_path / "images"))
+    local_tar = tmp_path / "one.tar"
+    _write_one_file_tar(local_tar, "one.txt")
+    mgr.pull_image(str(local_tar))
+
+    assert mgr._get_overlayfs_image(str(local_tar)) == mgr.get_rootfs_image(
+        str(local_tar)
+    )
+    with pytest.raises(SandboxCreationError):
+        mgr._get_overlayfs_image(str(tmp_path / "missing.tar"))
+
+
+def test_base_image_manager_rejects_overlayfs_sandboxes():
+    class _NoOverlayfsManager(BaseImageManager):
+        # Never called; they only make the class concrete.
+        pull_image = get_image_dir = get_image_config = None
+        get_workdir = get_envs = create_oci_spec = prepare_oci_bundle = None
+
+    with pytest.raises(SandboxCreationError, match="doesn't support overlayfs"):
+        _NoOverlayfsManager()._get_overlayfs_image("fake:latest")
 
 
 def test_oci_spec_docker_parity_hosts_and_tmp(tmp_path):

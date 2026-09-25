@@ -109,6 +109,20 @@ def _public_netns_supported() -> bool:
 
 
 @pytest.fixture(scope="session")
+def ensure_overlayfs_mount(ensure_runsc):
+    """A host that can mount an overlayfs sandbox's kernel overlay (see
+    ``overlayfs.mount_mode``). Requested rather than autouse, so
+    only the overlayfs tests skip when the host can't."""
+    from ray.experimental.sandbox._internal import overlayfs
+    from ray.experimental.sandbox.exceptions import SandboxCreationError
+
+    try:
+        overlayfs.mount_mode()
+    except SandboxCreationError as err:
+        pytest.skip(str(err))
+
+
+@pytest.fixture(scope="session")
 def ensure_slirp4netns(ensure_runsc):
     """slirp4netns plus a host that can actually run the network="public" path.
 

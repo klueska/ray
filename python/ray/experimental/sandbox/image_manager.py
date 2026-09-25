@@ -14,7 +14,12 @@ from ray.experimental.sandbox._internal.image_utils import (
     pull_and_extract_container_image,
     sanitize_image_name,
 )
-from ray.experimental.sandbox.config import DEFAULT_PUBLIC_DNS, parse_memory_bytes
+from ray.experimental.sandbox.config import (
+    DEFAULT_PUBLIC_DNS,
+    ROOTFS_EROFS,
+    VALID_ROOTFS_TYPES,
+    parse_memory_bytes,
+)
 from ray.experimental.sandbox.exceptions import SandboxCreationError
 
 logger = logging.getLogger(__name__)
@@ -84,6 +89,27 @@ class BaseImageManager(ABC):
         """
         return None
 
+    def _get_overlayfs_image(self, image: str) -> str:
+        """Get the cached EROFS image an overlayfs sandbox's kernel overlay
+        sits on.
+
+        The caller must hold a pin on the image (see ``pull_image``'s
+        ``instance_id``) so eviction leaves it alone.
+
+        Args:
+            image: Container image reference or tar path passed to ``pull_image``.
+
+        Returns:
+            Absolute path of the EROFS image.
+
+        Raises:
+            SandboxCreationError: If this manager doesn't support overlayfs
+                sandboxes, or the image isn't cached.
+        """
+        raise SandboxCreationError(
+            f"{type(self).__name__} doesn't support overlayfs sandboxes."
+        )
+
     @abstractmethod
     def get_image_dir(self, image: str) -> str:
         """Get the cached local directory path for an image.
@@ -148,6 +174,7 @@ class BaseImageManager(ABC):
         hosts_source: Optional[str] = None,
         base_spec: Optional[Dict[str, Any]] = None,
         root_path: Optional[str] = None,
+        _rootfs_type: str = ROOTFS_EROFS,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> Dict[str, Any]:
         """Construct an OCI container configuration specification dictionary.
@@ -176,6 +203,11 @@ class BaseImageManager(ABC):
                 comes from the gVisor annotations (the cached EROFS image);
                 this directory only anchors the overlay's backing file.
                 Defaults to a directory inside the image cache.
+                For an overlayfs sandbox, the backend mounts the sandbox's
+                kernel overlay on this directory, and the spec has no gVisor
+                rootfs annotations.
+            _rootfs_type: How the sandbox's rootfs is served (see
+                ``config.ROOTFS_EROFS`` and ``config.ROOTFS_OVERLAYFS``).
             _oci_spec_transform_fn: Optional callback to transform the final spec.
 
         Returns:
@@ -197,6 +229,7 @@ class BaseImageManager(ABC):
         capabilities: Optional[List[str]] = None,
         network: str = "none",
         dns: Optional[List[str]] = None,
+        _rootfs_type: str = ROOTFS_EROFS,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> str:
         """Prepare an OCI bundle directory containing config.json for a container instance.
@@ -215,6 +248,8 @@ class BaseImageManager(ABC):
             network: Sandbox network mode; picks the resolv.conf to mount
                 ("public"/dns: generated, "host": the host's own).
             dns: Optional nameserver IPs for the generated resolv.conf.
+            _rootfs_type: How the sandbox's rootfs is served (see
+                ``create_oci_spec``).
             _oci_spec_transform_fn: Optional OCI spec transform function.
 
         Returns:
@@ -268,6 +303,10 @@ class ImageManager(BaseImageManager):
             instance_id: The sandbox instance that no longer uses the image.
         """
         _release_image_use(self.get_image_dir(image), instance_id)
+
+    def _get_overlayfs_image(self, image: str) -> str:
+        """The cached ``rootfs.erofs`` (see ``get_rootfs_image``)."""
+        return self.get_rootfs_image(image)
 
     def get_image_dir(self, image: str) -> str:
         """Get the cached local directory path for an image.
@@ -373,6 +412,7 @@ class ImageManager(BaseImageManager):
         hosts_source: Optional[str] = None,
         base_spec: Optional[Dict[str, Any]] = None,
         root_path: Optional[str] = None,
+        _rootfs_type: str = ROOTFS_EROFS,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> Dict[str, Any]:
         """Construct an OCI container configuration specification dictionary.
@@ -401,6 +441,11 @@ class ImageManager(BaseImageManager):
                 comes from the gVisor annotations (the cached EROFS image);
                 this directory only anchors the overlay's backing file.
                 Defaults to a directory inside the image cache.
+                For an overlayfs sandbox, the backend mounts the sandbox's
+                kernel overlay on this directory, and the spec has no gVisor
+                rootfs annotations.
+            _rootfs_type: How the sandbox's rootfs is served (see
+                ``config.ROOTFS_EROFS`` and ``config.ROOTFS_OVERLAYFS``).
             _oci_spec_transform_fn: Optional callback to transform the final spec.
 
         Returns:
@@ -411,6 +456,12 @@ class ImageManager(BaseImageManager):
             if base_spec is not None
             else get_default_oci_spec()
         )
+
+        if _rootfs_type not in VALID_ROOTFS_TYPES:
+            raise ValueError(
+                f"Invalid rootfs type '{_rootfs_type}'. "
+                f"Expected one of {VALID_ROOTFS_TYPES}."
+            )
 
         image_dir = self.pull_image(image)
         erofs_image = os.path.join(image_dir, ROOTFS_IMAGE)
@@ -425,23 +476,28 @@ class ImageManager(BaseImageManager):
         # layer's backing file, so make it per sandbox.
         rootfs = root_path or os.path.join(image_dir, "root")
         os.makedirs(rootfs, exist_ok=True)
-        annotations = spec.setdefault("annotations", {})
-        annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
-        annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
-        # runsc applies no overlay to a read-only root, and an immutable image
-        # can't grow a mount point for an arbitrary workdir, so a readonly
-        # sandbox with an explicit workdir gets a private writable overlay
-        # instead (its writes are discarded with it).
-        if readonly and workdir_path is not None:
-            logger.warning(
-                "readonly=True with an explicit workdir: runsc cannot create "
-                "the workdir mount point in a read-only EROFS image, so this "
-                "sandbox runs on a private writable overlay (its writes are "
-                "discarded with it)."
-            )
-            readonly = False
-        if not readonly:
-            annotations["dev.gvisor.spec.rootfs.overlay"] = "self"
+        # Only an EROFS sandbox needs the gVisor rootfs annotations below. An
+        # overlayfs sandbox runs on the kernel overlay the backend mounts at
+        # root.path, where runsc can create mount points (including the
+        # workdir's) even for a readonly sandbox.
+        if _rootfs_type == ROOTFS_EROFS:
+            annotations = spec.setdefault("annotations", {})
+            annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
+            annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
+            # runsc applies no overlay to a read-only root, and an immutable image
+            # can't grow a mount point for an arbitrary workdir, so a readonly
+            # sandbox with an explicit workdir gets a private writable overlay
+            # instead (its writes are discarded with it).
+            if readonly and workdir_path is not None:
+                logger.warning(
+                    "readonly=True with an explicit workdir: runsc cannot create "
+                    "the workdir mount point in a read-only EROFS image, so this "
+                    "sandbox runs on a private writable overlay (its writes are "
+                    "discarded with it)."
+                )
+                readonly = False
+            if not readonly:
+                annotations["dev.gvisor.spec.rootfs.overlay"] = "self"
         spec["root"]["path"] = rootfs
         spec["root"]["readonly"] = readonly
 
@@ -593,6 +649,7 @@ class ImageManager(BaseImageManager):
         capabilities: Optional[List[str]] = None,
         network: str = "none",
         dns: Optional[List[str]] = None,
+        _rootfs_type: str = ROOTFS_EROFS,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> str:
         """Prepare an OCI bundle directory containing config.json for a container instance.
@@ -611,6 +668,8 @@ class ImageManager(BaseImageManager):
             network: Sandbox network mode; picks the resolv.conf to mount
                 ("public"/dns: generated, "host": the host's own).
             dns: Optional nameserver IPs for the generated resolv.conf.
+            _rootfs_type: How the sandbox's rootfs is served (see
+                ``create_oci_spec``).
             _oci_spec_transform_fn: Optional OCI spec transform function.
 
         Returns:
@@ -663,6 +722,7 @@ class ImageManager(BaseImageManager):
             resolv_conf_source=resolv_conf_source,
             hosts_source=hosts_source,
             root_path=rootfs_dir,
+            _rootfs_type=_rootfs_type,
             _oci_spec_transform_fn=_oci_spec_transform_fn,
         )
 
